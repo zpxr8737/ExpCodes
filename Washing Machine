@@ -1,0 +1,134 @@
+#include "mbed.h"  // Include the Mbed library for hardware abstraction
+
+// ========== Pin Assignments ==========
+DigitalIn startButton(PC_10); // Button to start washing cycle
+DigitalIn cycleButton(PC_11); // Button to change cycle stage
+DigitalIn stopButton(PD_2);   // Button to stop washing cycle
+BusOut leds_bus(PB_3,PB_5,PB_4);
+BusOut sevenSegment(PA_11,PA_12,PB_1,PB_15,PB_14,PB_12,PB_11); // 7-segment display segments A-G
+DigitalOut ledWash(PC_0);       // DigitalOut  LED for wash stage indicator
+DigitalOut ledRinse(PC_1);      //  DigitalOut LED for rinse stage indicator
+DigitalOut ledSpin(PB_0);       //  DigitalOut LED for spin stage indicator
+DigitalOut ledComplete(PA_4);   // DigitalOut LED for completed stage indicator
+AnalogIn tempSensor(PC_3);  // Analog input for temperature sensor
+AnalogIn fsrSensor(PA_1);   // Analog input for force-sensitive resistor (FSR)
+AnalogIn ldrSensor(PC_2);   // Analog input for light-dependent resistor (LDR)
+AnalogIn pot1(PA_5);   // Analog input for potentionemeter voltage reading
+AnalogIn pot2(PA_6);  // Analog input for potentionemeter voltage reading
+AnalogIn pot3(PA_7);  // Analog input for potentionemeter voltage reading
+PwmOut buzzer(PA_15);   // Buzzer to alert cycle completion
+Serial pc(USBTX, USBRX, 9600); // Serial monitor for status feedback via USB
+
+// ========== Constants and Enums ==========
+const int MIN_TEMP = 25; // Minimum safe water temperature in degrees Celsius
+const int numbers[10] = {0b00111111, 0b00000110, 0b01011011, 0b01001111, // 7-segment encoding for digits 0-9
+                         0b01100110, 0b01101101, 0b01111101, 0b00000111,
+                         0b01111111, 0b01101111};
+
+enum Stage { IDLE, WASH = 1, RINSE, SPIN, DONE }; // Enum for wash stages
+Stage currentStage = IDLE; // Initialize current stage as idle
+
+Timer washTimer;             // Timer to track cycle duration
+int totalCycleTime = 0;      // Total time for all stages combined
+bool showCycle = true;       // Toggle between showing cycle and time left
+
+// ========== Sensor Functions ==========
+int getWeight() { return (int)(fsrSensor.read() * 10); } // Reads and scales FSR sensor value to simulate load
+int getTemp() { return (int)(tempSensor.read() * 100); } // Reads and scales temperature sensor (0-100C)
+float getLight() { return ldrSensor.read(); }            // Reads light level (0.0 to 1.0)
+
+// ========== UI Functions ==========
+void updateBrightness() {
+    float brightness = 1.0f - getLight(); // Invert light level for LED brightness
+    ledWash.write(brightness);           // Adjust wash LED
+    ledRinse.write(brightness);          // Adjust rinse LED
+    ledSpin.write(brightness);           // Adjust spin LED
+}
+
+void displayCycle(int cycle) { 
+    sevenSegment = numbers[cycle]; // Display current stage number on 7-segment
+}
+
+void displayTimeLeft(int seconds) { 
+    sevenSegment = numbers[seconds % 10]; // Show remaining seconds (last digit only)
+}
+
+void alternateDisplay(int secondsLeft, int cycleNum) {
+    if (showCycle) displayCycle(cycleNum);   // Alternate between stage and time
+    else displayTimeLeft(secondsLeft);
+    showCycle = !showCycle;                  // Flip toggle each second
+}
+
+void printStatus() {
+    printf("\n[STATUS] Stage: %d | Temp: %dC | Weight: %dkg | Light: %.2f\n",
+           currentStage, getTemp(), getWeight(), getLight()); // Print sensor info
+}
+
+void printTimeInfo() {
+    int elapsed = washTimer.read_ms();                // Get elapsed time in ms
+    int remaining = totalCycleTime - elapsed;         // Calculate remaining time
+    if (remaining < 0) remaining = 0;                  // Prevent negative time
+    printf("Elapsed: %.2f s | Remaining: %.2f s\n", elapsed / 1000.0, remaining / 1000.0); // Print in seconds
+}
+
+void runStage(Stage stage, int duration_ms) {
+    currentStage = stage;        // Set current stage
+    printStatus();               // Print stage info
+    for (int t = duration_ms / 1000; t > 0; t--) { // Countdown in seconds
+        alternateDisplay(t, stage);  // Alternate 7-segment display
+        printTimeInfo();             // Print time info
+        thread_sleep_for(1000);     // Wait 1 second
+    }
+}
+
+void buzzerAlert(int ms = 2000) {
+    buzzer = 1;                   // Turn on buzzer
+    thread_sleep_for(ms);        // Wait for specified duration
+    buzzer = 0;                   // Turn off buzzer
+}
+
+void runCycle() {
+    if (getTemp() < MIN_TEMP) { // Check if water temp is too low
+        printf("[ERROR] Temperature too low. Cycle aborted.\n");
+        buzzerAlert();           // Alert user
+        return;                  // Exit cycle
+    }
+
+    int weight = getWeight();                      // Read laundry weight
+    int stageTime = 5000 + (weight * 500);         // Adjust stage time based on load
+    totalCycleTime = stageTime * 3;                // Total time for all three stages
+
+    washTimer.reset();      // Reset timer
+    washTimer.start();      // Start timer
+
+    runStage(WASH, stageTime);   // Run wash stage
+    runStage(RINSE, stageTime);  // Run rinse stage
+    runStage(SPIN, stageTime);   // Run spin stage
+
+    washTimer.stop();       // Stop timer after all stages
+    currentStage = DONE;    // Mark as done
+    displayCycle(0);        // Reset 7-segment
+    printStatus();          // Final status
+    printTimeInfo();        // Final time info
+    displayTimeLeft(0);     // Show 0 seconds left
+    buzzerAlert();          // Final buzzer alert
+    currentStage = IDLE;    // Reset stage
+}
+
+// ========== Main Loop ==========
+int main() {
+    printf("[INFO] Washing Machine Ready\n"); // Notify system is ready
+    while (true) {
+        updateBrightness(); // Adjust LED brightness based on light
+
+        if (startButton.read()) runCycle(); // Start cycle if button is pressed
+
+        if (cycleButton.read()) {                      // If cycle button pressed
+            currentStage = (Stage)((currentStage + 1) % 4); // Cycle through stages
+            displayCycle(currentStage);                      // Show stage on display
+            thread_sleep_for(300);                           // Debounce delay
+        }
+
+        thread_sleep_for(500); // Main loop delay
+    }
+}
